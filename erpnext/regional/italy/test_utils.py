@@ -1,1 +1,144 @@
-PLACEHOLDER
+# Copyright (c) 2026, Frappe Technologies Pvt. Ltd. and Contributors
+# See license.txt
+
+import types
+from unittest.mock import patch
+
+import frappe
+
+from erpnext.patches.v16_0.remove_invalid_fetch_from_italy_payment_schedule_swift_number import (
+	execute as remove_invalid_swift_number_fetch_from,
+)
+from erpnext.regional.italy.setup import get_custom_fields
+from erpnext.regional.italy.utils import (
+	append_row_as_charges,
+	get_conditions,
+	get_unamended_name,
+	set_payment_schedule_swift_number,
+	update_summary_details,
+)
+from erpnext.tests.utils import ERPNextTestSuite
+
+
+class TestItalyUtils(ERPNextTestSuite):
+	"""Pure helpers behind the Italian e-invoice export."""
+
+	def test_get_conditions_builds_filter_map(self):
+		base = get_conditions({})
+		self.assertEqual(base["docstatus"], 1)
+		self.assertEqual(base["company_tax_id"], ("!=", ""))
+		self.assertNotIn("company", base)
+
+		scoped = get_conditions({"company": "_Test Company", "customer": "_Test Customer"})
+		self.assertEqual(scoped["company"], "_Test Company")
+		self.assertEqual(scoped["customer"], "_Test Customer")
+
+		# a single bound uses >=/<=, both bounds use a between range
+		self.assertEqual(get_conditions({"from_date": "2026-01-01"})["posting_date"], (">=", "2026-01-01"))
+		self.assertEqual(get_conditions({"to_date": "2026-06-30"})["posting_date"], ("<=", "2026-06-30"))
+		self.assertEqual(
+			get_conditions({"from_date": "2026-01-01", "to_date": "2026-06-30"})["posting_date"],
+			("between", ["2026-01-01", "2026-06-30"]),
+		)
+
+	def test_update_summary_details_accumulates_and_flags_exemption(self):
+		summary = {}
+		tax = frappe._dict(tax_exemption_reason="N4", tax_exemption_law="Art. 10")
+
+		update_summary_details(summary, tax, 22.0, 44.0, 200.0)
+		update_summary_details(summary, tax, 22.0, 22.0, 100.0)
+		self.assertEqual(summary["22.0"]["tax_amount"], 66.0)
+		self.assertEqual(summary["22.0"]["taxable_amount"], 300.0)
+		# exemption fields are only populated for the zero-rate bucket
+		self.assertEqual(summary["22.0"]["tax_exemption_reason"], "")
+
+		update_summary_details(summary, tax, 0.0, 0.0, 500.0)
+		self.assertEqual(summary["0.0"]["tax_exemption_reason"], "N4")
+		self.assertEqual(summary["0.0"]["tax_exemption_law"], "Art. 10")
+
+	def test_append_row_as_charges_computes_amount(self):
+		items, summary = [], {}
+		tax = frappe._dict(rate=22.0, account_head="VAT - IT", tax_exemption_reason="", tax_exemption_law="")
+		reference_row = frappe._dict(tax_amount=200.0, description="Consulting")
+
+		append_row_as_charges(items, tax, reference_row, summary)
+
+		self.assertEqual(len(items), 1)
+		row = items[0]
+		self.assertEqual(row.tax_rate, 22.0)
+		self.assertEqual(row.tax_amount, 44.0)  # 200 * 22 / 100
+		self.assertEqual(row.taxable_amount, 200.0)
+		self.assertEqual(row.item_code, "Consulting")
+		self.assertEqual(row.item_tax_rate, {"VAT - IT": 22.0})
+		self.assertEqual(summary["22.0"]["tax_amount"], 44.0)
+
+	def test_get_unamended_name(self):
+		# a doc missing the naming attributes is returned unchanged
+		plain = types.SimpleNamespace(name="ACC-SINV-2026-00001")
+		self.assertEqual(get_unamended_name(plain), "ACC-SINV-2026-00001")
+
+		# an amended doc drops the trailing amendment suffix
+		amended = frappe._dict(
+			name="ACC-SINV-2026-00001-1",
+			naming_series="ACC-SINV-.YYYY.-",
+			amended_from="ACC-SINV-2026-00001",
+		)
+		self.assertEqual(get_unamended_name(amended), "ACC-SINV-2026-00001")
+
+		# an original (non-amended) doc keeps its name
+		original = frappe._dict(
+			name="ACC-SINV-2026-00001", naming_series="ACC-SINV-.YYYY.-", amended_from=None
+		)
+		self.assertEqual(get_unamended_name(original), "ACC-SINV-2026-00001")
+
+	def test_set_payment_schedule_swift_number_reads_bank(self):
+		# the SWIFT code lives on Bank, not on Bank Account: it is read through the account's bank
+		values = {
+			("Bank Account", "_Test Bank Account", "bank"): "_Test Bank",
+			("Bank", "_Test Bank", "swift_number"): "BCITITMM",
+		}
+		doc = frappe._dict(
+			payment_schedule=[
+				frappe._dict(bank_account="_Test Bank Account"),
+				frappe._dict(bank_account=None, bank_account_swift_number="STALE"),
+			]
+		)
+
+		with patch("frappe.get_cached_value", side_effect=lambda *args: values.get(args)):
+			set_payment_schedule_swift_number(doc)
+
+		self.assertEqual(doc.payment_schedule[0].bank_account_swift_number, "BCITITMM")
+		self.assertIsNone(doc.payment_schedule[1].bank_account_swift_number)
+
+	def test_payment_schedule_swift_number_is_not_fetched_from_bank_account(self):
+		# Bank Account has no swift_number: a fetch_from on it breaks every save with a bank account
+		field = next(
+			df
+			for df in get_custom_fields()["Payment Schedule"]
+			if df["fieldname"] == "bank_account_swift_number"
+		)
+		self.assertFalse(field.get("fetch_from"))
+
+	def test_validate_regional_sets_payment_schedule_swift_number(self):
+		# runs for every accounts document with a Payment Schedule, not only the exported Sales Invoice
+		from erpnext.controllers.accounts_controller import validate_regional
+
+		doc = frappe._dict(doctype="Sales Order", payment_schedule=[])
+		with (
+			patch("erpnext.get_region", return_value="Italy"),
+			patch("erpnext.regional.italy.utils.set_payment_schedule_swift_number") as set_swift_number,
+		):
+			validate_regional(doc)
+
+		set_swift_number.assert_called_once_with(doc)
+
+	def test_patch_clears_only_the_invalid_fetch_from(self):
+		for fetch_from, cleared in (("bank_account.swift_number", True), ("bank_account.custom_bic", False)):
+			with (
+				patch.object(frappe.db, "get_value", return_value=fetch_from),
+				patch.object(frappe.db, "set_value") as set_value,
+				patch("frappe.clear_cache"),
+			):
+				remove_invalid_swift_number_fetch_from()
+
+			self.assertEqual(set_value.called, cleared)
